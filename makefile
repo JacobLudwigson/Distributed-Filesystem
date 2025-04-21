@@ -1,6 +1,6 @@
 CC       := gcc
 CFLAGS   := -Wall -Wextra -g
-LDFLAGS  := 
+LDFLAGS  := -lm -lssl -lcrypto
 DFSLDFLAGS := -pthread
 
 DEBUG ?= 0
@@ -17,7 +17,7 @@ dfs: dfs.c
 	$(CC) $(CFLAGS) $< -o $@ $(DFSLDFLAGS)
 
 dfc: dfc.c
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
 	rm -f $(TARGETS) *.o

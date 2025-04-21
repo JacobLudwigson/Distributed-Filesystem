@@ -16,6 +16,14 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <string.h>
+/*
+    Fixes: 
+        When putting a file, will currently append to a file if already created.
+        This means putting the same file twice will create a weird double frankenstein copy
+        Need to figure out how to delete and recreate the file if it already exists on the server
+
+    
+*/
 #define MAX_RECEIVE_BUFFER 2048
 #define MAX_CLIENTS 100
 #define ERROR -1
@@ -35,7 +43,30 @@ void killHandler(int sig){
     }
     exit(1);
 }
+void clearCache(const char *dirPath) {
+    DIR *dir = opendir(dirPath);
+    if (!dir) {
+        perror("opendir failed");
+        return;
+    }
 
+    struct dirent *entry;
+    char filePath[512];
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        // Construct full file path
+        snprintf(filePath, sizeof(filePath), "%s/%s", dirPath, entry->d_name);
+
+        if (remove(filePath) != 0) {
+            perror("remove failed");
+        }
+    }
+
+    closedir(dir);
+}
 void* serveClient(void* args) {
     int clientSock = *(int*)args;
     free(args);
@@ -49,7 +80,8 @@ void* serveClient(void* args) {
     while (1) {
         // 2) Read one command line (up to newline)
         n = recv(clientSock, buf, MAX_RECEIVE_BUFFER-1, 0);
-        if (n <= 0) break;             // client closed or error
+        if (n <= 0) {break;}
+
         buf[n] = '\0';
 
         // 3) Tokenize: command [filename] [chunkPair] [length]\n
@@ -67,14 +99,17 @@ void* serveClient(void* args) {
             snprintf(path, sizeof(path), "%s/%s.%s", directory, fn, pair);
             int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0666);
             if (fd < 0) {
+                printf("Path: %s\n", path);
                 perror("open for put");
                 send(clientSock, "ERROR\n", 6, 0);
             } else {
                 int remaining = length;
+                send(clientSock, "\n", 1, 0);
                 while (remaining > 0) {
                     n = recv(clientSock, buf, 
-                             remaining > MAX_RECEIVE_BUFFER ? MAX_RECEIVE_BUFFER : remaining, 0);
+                             remaining > MAX_RECEIVE_BUFFER-1 ? MAX_RECEIVE_BUFFER-1 : remaining, 0);
                     if (n <= 0) break;
+                    buf[MAX_RECEIVE_BUFFER-1] = '\0';
                     write(fd, buf, n);
                     remaining -= n;
                 }
@@ -114,13 +149,24 @@ void* serveClient(void* args) {
                 while ((entry = readdir(d)) != NULL) {
                     if (entry->d_type == DT_REG) {
                         // send each chunk name back
-                        send(clientSock, entry->d_name,
-                             strlen(entry->d_name), 0);
-                        send(clientSock, "\n", 1, 0);
+                        if (send(clientSock, entry->d_name,strlen(entry->d_name), 0) < 0) {
+                            perror("[SERVER] Error in send");
+                            close(clientSock);
+                            return NULL;
+                        };
+                        if (send(clientSock, "\n", 1, 0) < 0) {
+                            perror("[SERVER] Error in send");
+                            close(clientSock);
+                            return NULL;
+                        };
                     }
                 }
                 closedir(d);
-                send(clientSock, "END\n", 4, 0);
+                if (send(clientSock, "END\n", 4, 0) < 0) {
+                    perror("[SERVER] Error in send");
+                    close(clientSock);
+                    return NULL;
+                };
             }
         }
         else {
@@ -140,6 +186,7 @@ int main(int argc, char **argv){
         exit(-1);
     }
     directory = argv[1];
+    clearCache(directory);
     struct sockaddr_in server;
     struct sockaddr_in client;
     int sock;
@@ -197,7 +244,7 @@ int main(int argc, char **argv){
             pthread_create(&ptid, NULL, &serveClient, data);
             pthread_detach(ptid);
         }
-        printf("\n\nHandling Client Connected from port no %d and IP %s\n",ntohs(client.sin_port), ip_str);
+        // printf("\n\nHandling Client Connected from port no %d and IP %s\n",ntohs(client.sin_port), ip_str);
     }
     close(sock);
 }

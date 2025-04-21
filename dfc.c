@@ -10,49 +10,57 @@
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <math.h>
+#include <openssl/md5.h>
 
-#define MAX_SERVERS  16 //Maybe
+#define MAX_SERVERS  16 
+#define MAX_FILES_PER_SERVER 32
 #define MAX_LINE     512
 #define MAX_NAME     256
 #define MAX_PAIR_STR 8
 #define MAX_BUF      8192
+typedef struct {
+    char filename[MAX_NAME];
+    char chunkPair[8];
+    int lowerChunk;
+    int upperChunk; 
+} file;
 
 typedef struct {
     char name[MAX_NAME];
     char ip[64];
     int  port;
+    int active;
+    int numFiles;
+    file* fileArr;
 } server;
 
 static server servers[MAX_SERVERS];
 static int       num_servers = 0;
 
-// the four canonical pairs
-static const int base_pairs[4][2] = {
-    {1,2},
-    {2,3},
-    {3,4},
-    {4,1}
-};
-
 // forward declarations
 int  parse_config(void);
-void do_list(void);
-void do_put(const char *filename);
+void do_list(int verbose);
+void do_put(const char *filename, int numActiveServers);
 void do_get(const char *filename);
 void printServers();
+int ping_active();
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,"Usage: %s <list|get|put> [filenames...]\n", argv[0]);
         return 1;
     }
     if (parse_config() < 0) return 1;
+    int numActiveServers = ping_active();
+    if (numActiveServers == 0){fprintf(stderr, "No active servers!\n"); return 0;} 
 
     if (strcmp(argv[1],"list")==0) {
-        do_list();
+        do_list(1);
     }
     else if (strcmp(argv[1],"put")==0) {
         for (int i = 2; i < argc; i++)
-            do_put(argv[i]);
+            do_put(argv[i], numActiveServers);
     }
     else if (strcmp(argv[1],"get")==0) {
         for (int i = 2; i < argc; i++)
@@ -71,8 +79,30 @@ void printServers(){
                "Server %d\n"
                "Name: %s\n"
                "Ip: %s\n"
-               "Portno: %d\n",
-                i, currServer.name, currServer.ip, currServer.port);
+               "Portno: %d\n"
+               "Active: %d\n",
+                i, currServer.name, currServer.ip, currServer.port, currServer.active);
+        if (i == num_servers-1){printf("*********\n");}
+    }
+}
+long long compute_md5(const char* filename, unsigned char* hashBuffer){
+    unsigned char md5Hash[MD5_DIGEST_LENGTH];
+    MD5_CTX ctx;
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, filename, strlen(filename));
+    MD5_Final(md5Hash, &ctx);
+    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+        sprintf((char*)(hashBuffer + i * 2), "%02x", md5Hash[i]);
+    }
+    unsigned long long a = *(unsigned long long*)hashBuffer;
+    unsigned long long b = *(unsigned long long*)(hashBuffer + 8);
+    return a ^ b;
+}
+void safeFilename(char *hex_str) {
+    for (int i = 0; i < MD5_DIGEST_LENGTH*2; i++) {
+        if (hex_str[i] == '/') {
+            hex_str[i] = '_';
+        }
     }
 }
 // ----------------------------------------------------------------------------
@@ -89,7 +119,7 @@ int parse_config(void) {
     int portno;
 
     while (fgets(line, MAX_LINE, configPtr)){
-        if (sscanf(line, "%s %s %s", entryType, serverName, addressWithPort) != 3)  {fprintf(stderr,"Invalid Entry in Config File!\n"); return -1;};
+        if (sscanf(line, "%s %s %s", entryType, serverName, addressWithPort) != 3)  {fprintf(stderr,"Invalid Entry in Config File!\n"); return -1;}
         port = strchr(addressWithPort, ':')+1;
         portno = atoi(port);
         *(port-1) = '\0';
@@ -97,9 +127,12 @@ int parse_config(void) {
         strcpy(servers[num_servers].ip, addressWithPort);
         strcpy(servers[num_servers].name, serverName);
         servers[num_servers].port = portno;
+        servers[num_servers].active = 1;
         num_servers+=1;
     }
+    return 0;
 }
+
 //Initiate a TCP connection and return a file descriptor
 int do_tcp(char* ipString, int port){
     int sockfd;
@@ -107,8 +140,8 @@ int do_tcp(char* ipString, int port){
     if (sockfd < 0) {perror("Error in socket creation"); return -1;}
 
     struct timeval timeout;      
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 500;
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
     if (setsockopt (sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,sizeof timeout) < 0 || setsockopt (sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout,sizeof timeout) < 0){
         close(sockfd);
         perror("setsockopt failed ");
@@ -125,27 +158,112 @@ int do_tcp(char* ipString, int port){
 
     return sockfd;
 }
-void do_list(void) {
+void do_list(int verbose) {
     char recvBuffer[MAX_BUF];
-    int n;
+    int n = 1;
+    int fileno;
     for (int i = 0; i < num_servers; i++){
+        fileno = 0;
         server currServer = servers[i];
+        if (!servers[i].fileArr){
+            servers[i].fileArr = malloc(sizeof(file) * MAX_FILES_PER_SERVER);
+        }
+        if (!currServer.active){continue;}
         int sockHandle = do_tcp(currServer.ip,currServer.port);
-        if (send(sockHandle, "list", strlen("list"), 0) < 0) {perror("Error in send('list')"); close(sockHandle); return;}
-
-        while (n = recv(sockHandle, recvBuffer, MAX_BUF, 0)){
-            if (n <= 0){break;}
+        if (sockHandle < 0){servers[i].active = 0; continue;}
+        if (send(sockHandle, "list", strlen("list"), 0) < 0) {perror("Error in send('list')"); servers[i].active = 0; close(sockHandle); continue;}
+        while (n > 0){
+            n = recv(sockHandle, recvBuffer, MAX_BUF-1, 0);
+            if (n < 0){
+                servers[i].active = 0;
+            }
+            if (n == 0){break;}
+            recvBuffer[MAX_BUF-1] = '\0';
             if (strstr(recvBuffer, "END")) {break;}
-            fwrite(recvBuffer, 1, n, stdout);
+            if (strchr(recvBuffer, '.')){
+                char* line = strtok(recvBuffer, "\0");
+                strcpy(servers[i].fileArr[fileno].filename, line);
+                printf("Adding filename : %s\n", servers[i].fileArr[fileno].filename);
+                while ((line = strtok(NULL, "\0"))){
+                    strcpy(servers[i].fileArr[fileno].filename, line);
+                    printf("\nAdding filename : %s\n", servers[i].fileArr[fileno].filename);
+
+                }
+                fileno+=1;
+
+            }
+            // if (verbose) {fwrite(recvBuffer, 1, n+1, stdout);}
         }
         close(sockHandle);
     }
 }
-
+int ping_active(){
+    int activeServers = 0;
+    do_list(0);
+    for (int i = 0; i < num_servers; i++){
+        activeServers += servers[i].active;
+    }
+    return activeServers;
+}
 // ----------------------------------------------------------------------------
 // put: split file into 4, send each server its overlapping pair
-void do_put(const char *filename) {
+void do_put(const char *filename, int numActiveServers) {
+    FILE* fptr = fopen(filename, "r");
+    fseek(fptr, 0, SEEK_END);
+    long int totalFileSize = ftell(fptr);
+    rewind(fptr);
+    unsigned char digest[2*MD5_DIGEST_LENGTH+1];
     
+    int startIndex = compute_md5(filename,digest) % numActiveServers;
+    printf("The Start is %d\n", startIndex);
+
+    char name[MAX_LINE];
+    char chunkPair[MAX_PAIR_STR];
+
+    int base_chunk_size = totalFileSize / numActiveServers;
+    int last_chunk_extra = totalFileSize % numActiveServers;
+
+    char **chunks = malloc(numActiveServers * sizeof(char *));
+    int *chunk_sizes = malloc(numActiveServers * sizeof(int));
+    for (int i = 0; i < numActiveServers; i++) {
+        int size = base_chunk_size + (i == numActiveServers - 1 ? last_chunk_extra : 0);
+        chunks[i] = malloc(size);
+        fread(chunks[i], 1, size, fptr);
+        chunk_sizes[i] = size;
+    }
+    fclose(fptr);
+    int upperChunkPairNum = (startIndex+1) % numActiveServers;
+    int lowerChunkPairNum = startIndex;
+    int bytes_to_send;
+    for (int i = 0; i < num_servers; i++){
+        bytes_to_send = chunk_sizes[lowerChunkPairNum] + chunk_sizes[upperChunkPairNum] + 4;
+
+        server currServer = servers[i];
+        snprintf(chunkPair, sizeof(chunkPair), "%d,%d", lowerChunkPairNum+1, upperChunkPairNum+1);
+
+        if (!currServer.active){continue;}
+        int sockHandle = do_tcp(currServer.ip,currServer.port);
+
+        //Format: command [filename] [chunkPair] [length]\n
+        snprintf(name,sizeof(name), "put %s %s %d\n",filename, chunkPair, bytes_to_send);
+        char ack[2];
+        recv(sockHandle, ack, 1, 0);
+        if (send(sockHandle, name, strlen(name), 0) < 0) {perror("Error in send('Put Headers')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
+        if (send(sockHandle, chunks[lowerChunkPairNum], chunk_sizes[lowerChunkPairNum], 0) < 0) {perror("Error in send('Lower Chunk')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
+        if (send(sockHandle, "\r\n\r\n", 4, 0) < 0) {perror("Error in send('CLRF Carriage')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
+        if (send(sockHandle, chunks[upperChunkPairNum], chunk_sizes[upperChunkPairNum], 0) < 0) {perror("Error in send('Upper Chunk')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
+
+
+        
+        lowerChunkPairNum = upperChunkPairNum;
+        upperChunkPairNum = (upperChunkPairNum + 1) % numActiveServers;
+        close(sockHandle);
+    }
+    for (int i = 0; i < numActiveServers; i++) {
+        free(chunks[i]);
+    }
+    free(chunk_sizes);
+    free(chunks);
 }
 
 // ----------------------------------------------------------------------------
