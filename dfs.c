@@ -26,9 +26,47 @@
 */
 #define MAX_RECEIVE_BUFFER 2048
 #define MAX_CLIENTS 100
+#define MAX_NAME 512
 #define ERROR -1
+
 atomic_int countActiveThreads;
 char* directory;
+char* delete_dup_file(const char *filename, const char *directory, int delete) {
+    DIR *dir = opendir(directory);
+    if (!dir) {
+        perror("opendir");
+        return 0;
+    }
+
+    struct dirent *entry;
+    int target_len = strlen(filename);
+
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+
+        char *first_dot = strchr(name, '.');
+        char *last_dot  = strrchr(name, '.');
+        if (!first_dot || !last_dot || last_dot == first_dot) {continue;}
+        int seg_len = last_dot - (first_dot + 1);
+
+        if (seg_len != target_len) {continue;}
+        if (strncmp(first_dot + 1, filename, seg_len) == 0) {
+            char* path = malloc(MAX_NAME);
+            snprintf(path, MAX_NAME, "%s/%s", directory, name);
+            if (delete) {
+                remove(path);
+                closedir(dir);
+                free(path);
+                return NULL;
+            }
+            closedir(dir);
+            return path;
+        }
+    }
+    closedir(dir);
+    return NULL;
+}
 void killHandler(int sig){
     signal(sig, SIG_IGN);
     printf("\nFinishing serving clients...\n");
@@ -81,7 +119,7 @@ void* serveClient(void* args) {
         // 2) Read one command line (up to newline)
         n = recv(clientSock, buf, MAX_RECEIVE_BUFFER-1, 0);
         if (n <= 0) {break;}
-
+        printf("******%s******\n", directory);
         buf[n] = '\0';
 
         // 3) Tokenize: command [filename] [chunkPair] [length]\n
@@ -96,7 +134,9 @@ void* serveClient(void* args) {
         if (strcmp(cmd, "put") == 0) {
             // read exactly `length` bytes and write into directory/fn.pair
             char path[512];
+            
             snprintf(path, sizeof(path), "%s/%s.%s", directory, fn, pair);
+            delete_dup_file(strchr(fn, '.')+1, directory, 1);
             int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0666);
             if (fd < 0) {
                 printf("Path: %s\n", path);
@@ -108,31 +148,50 @@ void* serveClient(void* args) {
                 while (remaining > 0) {
                     n = recv(clientSock, buf, 
                              remaining > MAX_RECEIVE_BUFFER-1 ? MAX_RECEIVE_BUFFER-1 : remaining, 0);
+                    printf("Received %ld bytes in data\n", n);
                     if (n <= 0) break;
                     buf[MAX_RECEIVE_BUFFER-1] = '\0';
                     write(fd, buf, n);
                     remaining -= n;
                 }
                 close(fd);
-                send(clientSock, "OK\n", 3, 0);
             }
         }
         else if (strcmp(cmd, "get") == 0) {
             // open directory/fn.pair, stat to find size, send “DATA size\n” then content
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s.%s", directory, fn, pair);
+            char *path;
+            path = delete_dup_file(fn, directory, 0);
             struct stat st;
             if (stat(path, &st) < 0) {
                 send(clientSock, "ERROR\n", 6, 0);
             } else {
-                // tell client how many bytes
-                char header[64];
-                int sz = st.st_size;
-                int hlen = snprintf(header, sizeof(header), "DATA %d\n", sz);
-                send(clientSock, header, hlen, 0);
-
-                // stream file
                 int fd = open(path, O_RDONLY);
+                if (fd == -1) {
+                    perror("Error opening file");
+                    continue;
+                }
+                send(clientSock, path, strlen(path), 0);
+                char ack[4];
+                free(path);
+                
+                if (recv(clientSock, ack, 1, 0) <= 0){ //File Name Ack
+                    close(fd);
+                    continue;
+                }
+
+                int bytes = read(fd, buf, 8);
+                n = send(clientSock, buf, bytes, 0);
+                if (n < 8){
+                    perror("Error in sending chunk sizes"); 
+                    close(fd);
+                    continue;
+                }
+
+                if (recv(clientSock, ack, 1, 0) <= 0){ //File Chunk Headers Ack
+                    close(fd);
+                    continue;
+                }
+
                 while ((n = read(fd, buf, MAX_RECEIVE_BUFFER)) > 0) {
                     send(clientSock, buf, n, 0);
                 }
@@ -170,7 +229,6 @@ void* serveClient(void* args) {
             }
         }
         else {
-            // unknown command
             send(clientSock, "ERROR Unknown command\n", 21, 0);
         }
     }
@@ -195,13 +253,13 @@ int main(int argc, char **argv){
     int port = atoi(argv[2]);
 
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == ERROR){
-        perror("Error in socket : ");
+        perror("Error in socket ");
         exit(-1);
     }
     int op = 1;
 
     if (setsockopt(sock, SOL_SOCKET,SO_REUSEADDR, &op, sizeof(op)) < 0){
-        perror("Error setting sock op: ");
+        perror("Error setting sock op ");
         exit(-1);
     }
     server.sin_family = AF_INET;
@@ -209,12 +267,12 @@ int main(int argc, char **argv){
     server.sin_addr.s_addr = INADDR_ANY;
     bzero(&server.sin_zero,8);
     if ((bind(sock, (struct sockaddr* )&server, socketaddr_len)) == ERROR){
-        perror("Error in bind : ");
+        perror("Error in bind ");
         exit(-1);
     }
 
     if ((listen(sock, MAX_CLIENTS)) == -1){
-        perror("Error in listen : ");
+        perror("Error in listen ");
         exit(-1);
     }
     char ip_str[INET_ADDRSTRLEN];
@@ -223,14 +281,14 @@ int main(int argc, char **argv){
     signal(SIGINT, killHandler);
     while (1){
         if ((newClientSock = accept(sock, (struct sockaddr *) &client, &socketaddr_len)) == ERROR){
-            perror("Error in accept : ");
+            perror("Error in accept ");
             exit(-1);
         }
         if (inet_ntop(AF_INET, &client.sin_addr, ip_str, sizeof(ip_str)) == NULL) {
-            perror("inet_ntop error");
+            perror("inet_ntop error ");
         }
         struct timeval timeout;      
-        timeout.tv_sec = 10;
+        timeout.tv_sec = 2;
         timeout.tv_usec = 0;
         if (setsockopt (newClientSock, SOL_SOCKET, SO_RCVTIMEO, &timeout,sizeof timeout) < 0 || setsockopt (newClientSock, SOL_SOCKET, SO_SNDTIMEO, &timeout,sizeof timeout) < 0){
             close(newClientSock);

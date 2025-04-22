@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/select.h>
 #include <arpa/inet.h>
 #include <math.h>
@@ -19,20 +20,12 @@
 #define MAX_NAME     256
 #define MAX_PAIR_STR 8
 #define MAX_BUF      8192
-typedef struct {
-    char filename[MAX_NAME];
-    char chunkPair[8];
-    int lowerChunk;
-    int upperChunk; 
-} file;
 
 typedef struct {
     char name[MAX_NAME];
     char ip[64];
     int  port;
     int active;
-    int numFiles;
-    file* fileArr;
 } server;
 
 static server servers[MAX_SERVERS];
@@ -70,6 +63,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,"Unknown cmd '%s'\n", argv[1]);
         return 1;
     }
+    printServers();
     return 0;
 }
 void printServers(){
@@ -161,13 +155,9 @@ int do_tcp(char* ipString, int port){
 void do_list(int verbose) {
     char recvBuffer[MAX_BUF];
     int n = 1;
-    int fileno;
     for (int i = 0; i < num_servers; i++){
-        fileno = 0;
         server currServer = servers[i];
-        if (!servers[i].fileArr){
-            servers[i].fileArr = malloc(sizeof(file) * MAX_FILES_PER_SERVER);
-        }
+        if (verbose) printf("*****%s*****\n",currServer.name);
         if (!currServer.active){continue;}
         int sockHandle = do_tcp(currServer.ip,currServer.port);
         if (sockHandle < 0){servers[i].active = 0; continue;}
@@ -180,19 +170,7 @@ void do_list(int verbose) {
             if (n == 0){break;}
             recvBuffer[MAX_BUF-1] = '\0';
             if (strstr(recvBuffer, "END")) {break;}
-            if (strchr(recvBuffer, '.')){
-                char* line = strtok(recvBuffer, "\0");
-                strcpy(servers[i].fileArr[fileno].filename, line);
-                printf("Adding filename : %s\n", servers[i].fileArr[fileno].filename);
-                while ((line = strtok(NULL, "\0"))){
-                    strcpy(servers[i].fileArr[fileno].filename, line);
-                    printf("\nAdding filename : %s\n", servers[i].fileArr[fileno].filename);
-
-                }
-                fileno+=1;
-
-            }
-            // if (verbose) {fwrite(recvBuffer, 1, n+1, stdout);}
+            if (verbose) {fwrite(recvBuffer, 1, n+1, stdout);}
         }
         close(sockHandle);
     }
@@ -236,7 +214,8 @@ void do_put(const char *filename, int numActiveServers) {
     int lowerChunkPairNum = startIndex;
     int bytes_to_send;
     for (int i = 0; i < num_servers; i++){
-        bytes_to_send = chunk_sizes[lowerChunkPairNum] + chunk_sizes[upperChunkPairNum] + 4;
+
+        bytes_to_send = chunk_sizes[lowerChunkPairNum] + chunk_sizes[upperChunkPairNum] + 8;
 
         server currServer = servers[i];
         snprintf(chunkPair, sizeof(chunkPair), "%d,%d", lowerChunkPairNum+1, upperChunkPairNum+1);
@@ -245,15 +224,39 @@ void do_put(const char *filename, int numActiveServers) {
         int sockHandle = do_tcp(currServer.ip,currServer.port);
 
         //Format: command [filename] [chunkPair] [length]\n
-        snprintf(name,sizeof(name), "put %s %s %d\n",filename, chunkPair, bytes_to_send);
-        char ack[2];
-        recv(sockHandle, ack, 1, 0);
+        snprintf(name,sizeof(name), "put [%d].%s %s %d\n",numActiveServers, filename, chunkPair, bytes_to_send);
+        char ack[4];
+        int n;
         if (send(sockHandle, name, strlen(name), 0) < 0) {perror("Error in send('Put Headers')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
-        if (send(sockHandle, chunks[lowerChunkPairNum], chunk_sizes[lowerChunkPairNum], 0) < 0) {perror("Error in send('Lower Chunk')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
-        if (send(sockHandle, "\r\n\r\n", 4, 0) < 0) {perror("Error in send('CLRF Carriage')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
-        if (send(sockHandle, chunks[upperChunkPairNum], chunk_sizes[upperChunkPairNum], 0) < 0) {perror("Error in send('Upper Chunk')"); servers[i].active = 0; close(sockHandle); i = 0; continue;}
+        recv(sockHandle, ack, 1, 0);
+
+        uint32_t sz1 = htonl((uint32_t)chunk_sizes[lowerChunkPairNum]);
+        uint32_t sz2 = htonl((uint32_t)chunk_sizes[upperChunkPairNum]);
+
+        n = send(sockHandle, &sz1, 4, 0);
+        n += send(sockHandle, &sz2, 4, 0);
 
 
+        ssize_t sent = 0;
+        while (sent < chunk_sizes[lowerChunkPairNum]) {
+            ssize_t w = send(sockHandle,
+                            chunks[lowerChunkPairNum] + sent,
+                            chunk_sizes[lowerChunkPairNum] - sent,
+                            0);
+            if (w <= 0) { perror("Error sending chunk1"); break; }
+            sent += w;
+        }
+
+        sent = 0;
+        while (sent < chunk_sizes[upperChunkPairNum]) {
+            ssize_t w = send(sockHandle,
+                            chunks[upperChunkPairNum] + sent,
+                            chunk_sizes[upperChunkPairNum] - sent,
+                            0);
+            if (w <= 0) { perror("Error sending chunk2"); break; }
+            sent += w;
+        }
+        shutdown(sockHandle, SHUT_WR);
         
         lowerChunkPairNum = upperChunkPairNum;
         upperChunkPairNum = (upperChunkPairNum + 1) % numActiveServers;
@@ -269,5 +272,91 @@ void do_put(const char *filename, int numActiveServers) {
 // ----------------------------------------------------------------------------
 // get: fetch each pair, rebuild chunks 1–4, write file
 void do_get(const char *filename) {
+    char name[MAX_NAME];
+    char serverFilename[MAX_NAME];
+    char fileMetaData[8];
+    snprintf(name,sizeof(name), "get %s\n",filename);
+    char** chunks = NULL;
+    int* chunk_sizes = NULL;
+    int serversActiveWhilePut = 0;
+    for (int i = 0; i < num_servers; i++){
+        server currServer = servers[i];
+
+        if (!currServer.active){continue;}
+        int sockHandle = do_tcp(currServer.ip,currServer.port);
+
+        if (send(sockHandle, name, strlen(name), 0) < 0) {perror("Error in send('get header')"); servers[i].active = 0; close(sockHandle); continue;}
+        int n = recv(sockHandle, serverFilename, MAX_NAME, 0);
+        if (n <= 0){perror("Error in receive filename"); close(sockHandle); servers[i].active = 0; close(sockHandle); continue;}
+        if (strcmp(serverFilename, "ERROR\n") == 0){printf("Server side error on filename verification");continue;}
+
+        if (send(sockHandle, "\n", 1, 0) < 0) {perror("Error in send('Get Ack 1')"); servers[i].active = 0; close(sockHandle); continue;}
+        n = recv(sockHandle, fileMetaData, 8, 0);
+        if (n <= 0){perror("Error in receive metadata"); close(sockHandle); servers[i].active = 0; close(sockHandle); continue;}
+
+        uint32_t net_len1, net_len2;
+        memcpy(&net_len1, fileMetaData,     4);
+        memcpy(&net_len2, fileMetaData + 4, 4);
+        int32_t firstChunkLen  = ntohl(net_len1);
+        int32_t secondChunkLen = ntohl(net_len2);
+        if (send(sockHandle, "\n", 1, 0) < 0) {perror("Error in send('Get Ack 2')"); servers[i].active = 0; close(sockHandle); continue;}
+
+        char* passDir = strchr(serverFilename, '/')+1;
+        sscanf(passDir, "[%d].%*s", &serversActiveWhilePut);
+        char* chunkPair = strrchr(serverFilename, '.')+1;
+        int firstChunkNum, secondChunkNum;
+        sscanf(chunkPair, "%d,%d", &firstChunkNum, &secondChunkNum);
+        firstChunkNum-=1;
+        secondChunkNum-=1;
+        printf("Here is the filename %s\n", serverFilename);
+        if (!chunks){
+            chunks = malloc(serversActiveWhilePut * sizeof(char *));
+            chunk_sizes = malloc(serversActiveWhilePut * sizeof(int));
+        }
+
+        if (!chunks[firstChunkNum]){
+            chunks[firstChunkNum] = malloc(sizeof(char) * firstChunkLen);
+        }
+        chunk_sizes[firstChunkNum] = firstChunkLen;
+        int remaining = firstChunkLen;
+        while (remaining > 0) {
+            n = recv(sockHandle, chunks[firstChunkNum] + (firstChunkLen - remaining), remaining, 0);
+            if (n <= 0) break;
+            remaining -= n;
+        }
+
+        if (!chunks[secondChunkNum]){
+            chunks[secondChunkNum] = malloc(sizeof(char) * secondChunkLen);
+        }
+        chunk_sizes[secondChunkNum] = secondChunkLen;
+        remaining = secondChunkLen;
+        while (remaining > 0) {
+            n = recv(sockHandle, chunks[secondChunkNum] + (secondChunkLen - remaining), remaining, 0);
+            if (n <= 0) break;
+            remaining -= n;
+        }
+
+        shutdown(sockHandle, SHUT_WR);
+        close(sockHandle);
+    }
+    int toWrite = 1;
+    int fd;
+    for (int i = 0; i < serversActiveWhilePut; i++) {
+        if (!chunks[i]) {
+            toWrite = 0;
+        }
+    }
+    printf("%s is incomplete\n", filename);
+    if (toWrite){
+        fd = open(filename, O_WRONLY|O_CREAT|O_TRUNC, 0666);
+    } 
+    for (int i = 0; i < serversActiveWhilePut; i++) {
+        if (toWrite){ 
+            write(fd, chunks[i], chunk_sizes[i]);
+        }
+        free(chunks[i]);
+    }
+    free(chunk_sizes);
+    free(chunks);
     
 }
