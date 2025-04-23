@@ -63,7 +63,6 @@ int main(int argc, char **argv) {
         fprintf(stderr,"Unknown cmd '%s'\n", argv[1]);
         return 1;
     }
-    printServers();
     return 0;
 }
 void printServers(){
@@ -134,7 +133,7 @@ int do_tcp(char* ipString, int port){
     if (sockfd < 0) {perror("Error in socket creation"); return -1;}
 
     struct timeval timeout;      
-    timeout.tv_sec = 2;
+    timeout.tv_sec = 1;
     timeout.tv_usec = 0;
     if (setsockopt (sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,sizeof timeout) < 0 || setsockopt (sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout,sizeof timeout) < 0){
         close(sockfd);
@@ -287,8 +286,8 @@ void do_get(const char *filename) {
 
         if (send(sockHandle, name, strlen(name), 0) < 0) {perror("Error in send('get header')"); servers[i].active = 0; close(sockHandle); continue;}
         int n = recv(sockHandle, serverFilename, MAX_NAME, 0);
-        if (n <= 0){perror("Error in receive filename"); close(sockHandle); servers[i].active = 0; close(sockHandle); continue;}
-        if (strcmp(serverFilename, "ERROR\n") == 0){printf("Server side error on filename verification");continue;}
+        if (n <= 0){perror("Error in receive filename"); close(sockHandle); servers[i].active = 0; continue;}
+        if (strcmp(serverFilename, "ERROR\n") == 0){printf("Server side error on filename verification"); close(sockHandle); continue;}
 
         if (send(sockHandle, "\n", 1, 0) < 0) {perror("Error in send('Get Ack 1')"); servers[i].active = 0; close(sockHandle); continue;}
         n = recv(sockHandle, fileMetaData, 8, 0);
@@ -308,7 +307,6 @@ void do_get(const char *filename) {
         sscanf(chunkPair, "%d,%d", &firstChunkNum, &secondChunkNum);
         firstChunkNum-=1;
         secondChunkNum-=1;
-        printf("Here is the filename %s\n", serverFilename);
         if (!chunks){
             chunks = malloc(serversActiveWhilePut * sizeof(char *));
             chunk_sizes = malloc(serversActiveWhilePut * sizeof(int));
@@ -346,7 +344,7 @@ void do_get(const char *filename) {
             toWrite = 0;
         }
     }
-    printf("%s is incomplete\n", filename);
+    if (!toWrite) {printf("%s is incomplete\n", filename);}
     if (toWrite){
         fd = open(filename, O_WRONLY|O_CREAT|O_TRUNC, 0666);
     } 

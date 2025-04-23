@@ -232,8 +232,6 @@ void* serveClient(void* args) {
             send(clientSock, "ERROR Unknown command\n", 21, 0);
         }
     }
-
-    // 4) Cleanup
     close(clientSock);
     atomic_fetch_sub(&countActiveThreads, 1);
     return NULL;
@@ -244,7 +242,6 @@ int main(int argc, char **argv){
         exit(-1);
     }
     directory = argv[1];
-    clearCache(directory);
     struct sockaddr_in server;
     struct sockaddr_in client;
     int sock;
